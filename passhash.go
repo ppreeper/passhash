@@ -1,49 +1,42 @@
+// Package passhash provides password hashing and verification using PBKDF2-SHA512.
+//
+// Passwords are hashed into modular crypt format strings:
+//
+//	$pbkdf2-sha512$<iterations>$<salt>$<hash>
 package passhash
 
 import (
-	"bytes"
+	"crypto/rand"
 	"crypto/sha512"
+	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
-	"math/rand"
 	"strconv"
 	"strings"
-	"time"
 
 	pbkdf2lib "golang.org/x/crypto/pbkdf2"
 )
 
-var src = rand.NewSource(time.Now().UnixNano())
-
 const (
-	randomSize       = 24
-	iterationDefault = 25000
+	// randomSize is the number of random bytes used for salt generation.
+	randomSize = 16
+
+	// iterationDefault is the default PBKDF2 iteration count.
+	// OWASP (2023) recommends 600,000 for PBKDF2-SHA512; 210,000 is a
+	// reasonable balance between security and performance.
+	iterationDefault = 210000
+
+	// algorithmID is the identifier written into the modular crypt format string.
+	algorithmID = "pbkdf2-sha512"
 )
 
-const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-const (
-	letterIdxBits = 6                    // 6 bits to represent a letter index
-	letterIdxMask = 1<<letterIdxBits - 1 // All 1-bits, as many as letterIdxBits
-	letterIdxMax  = 63 / letterIdxBits   // # of letter indices fitting in 63 bits
-)
-
-func getRandomString(n int) string {
-	sb := strings.Builder{}
-	sb.Grow(n)
-	// A src.Int63() generates 63 random bits, enough for letterIdxMax characters!
-	for i, cache, remain := n-1, src.Int63(), letterIdxMax; i >= 0; {
-		if remain == 0 {
-			cache, remain = src.Int63(), letterIdxMax
-		}
-		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
-			sb.WriteByte(letterBytes[idx])
-			i--
-		}
-		cache >>= letterIdxBits
-		remain--
+// generateSalt returns randomSize cryptographically random bytes.
+func generateSalt(n int) ([]byte, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return nil, fmt.Errorf("generating salt: %w", err)
 	}
-
-	return sb.String()
+	return b, nil
 }
 
 func b64Decode(s string) ([]byte, error) {
@@ -56,6 +49,10 @@ func b64Encode(b []byte) string {
 	return strings.ReplaceAll(s, "+", ".")
 }
 
+// MakePassword derives a PBKDF2-SHA512 hash from the given password.
+// If iteration is 0, the default iteration count is used.
+// If salt is empty, a cryptographically random salt is generated.
+// Returns a modular crypt format string: $pbkdf2-sha512$<iterations>$<salt>$<hash>.
 func MakePassword(password string, iteration int, salt string) (string, error) {
 	if len(password) == 0 {
 		return "", fmt.Errorf("password cannot be empty")
@@ -63,29 +60,50 @@ func MakePassword(password string, iteration int, salt string) (string, error) {
 	if iteration == 0 {
 		iteration = iterationDefault
 	}
-	saltb := []byte(salt)
+
+	var saltb []byte
 	if len(salt) == 0 {
-		saltb = []byte(getRandomString(randomSize))
+		var err error
+		saltb, err = generateSalt(randomSize)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		saltb = []byte(salt)
 	}
+
 	key := pbkdf2lib.Key([]byte(password), saltb, iteration, sha512.Size, sha512.New)
-	return fmt.Sprintf("$pbkdf2-sha512$%d$%s$%s", iteration, b64Encode(saltb), b64Encode(key)), nil
+	return fmt.Sprintf("$%s$%d$%s$%s", algorithmID, iteration, b64Encode(saltb), b64Encode(key)), nil
 }
 
-func CheckPassword(password string, passwordHash string) bool {
+// CheckPassword verifies a plaintext password against a stored hash string.
+// It returns true if the password matches, false otherwise.
+// An error is returned if the hash string is malformed or cannot be parsed.
+func CheckPassword(password string, passwordHash string) (bool, error) {
 	tokens := strings.Split(passwordHash, "$")
+	if len(tokens) != 5 {
+		return false, fmt.Errorf("invalid hash format: expected 5 $-delimited tokens, got %d", len(tokens))
+	}
+
+	if tokens[1] != algorithmID {
+		return false, fmt.Errorf("unsupported algorithm: %q (expected %q)", tokens[1], algorithmID)
+	}
+
 	iteration, err := strconv.Atoi(tokens[2])
 	if err != nil {
-		fmt.Printf("Failed to convert iteration to integer: %s", err)
+		return false, fmt.Errorf("parsing iteration count: %w", err)
 	}
+
 	salt, err := b64Decode(tokens[3])
 	if err != nil {
-		fmt.Printf("Failed to base64 decode the salt: %s", err)
+		return false, fmt.Errorf("decoding salt: %w", err)
 	}
-	passwordHashInDatabase, err := b64Decode(tokens[4])
+
+	storedHash, err := b64Decode(tokens[4])
 	if err != nil {
-		fmt.Printf("Failed to base64 decode password hash from the database: %s", err)
+		return false, fmt.Errorf("decoding hash: %w", err)
 	}
 
 	key := pbkdf2lib.Key([]byte(password), salt, iteration, sha512.Size, sha512.New)
-	return bytes.Equal(key, passwordHashInDatabase)
+	return subtle.ConstantTimeCompare(key, storedHash) == 1, nil
 }
